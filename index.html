@@ -530,7 +530,7 @@ const CFG = {
   zoom:          11,
   alertMiles:    5,
   refreshSecs:   30,
-  septraUrl:     'https://www3.septa.org/api/TrainView/index.php',
+  septraUrl:     'https://corsproxy.io/?url=https%3A%2F%2Fwww3.septa.org%2Fapi%2FTrainView%2Findex.php',
   amtrakUrl:     'https://api-v3.amtraker.com/v3/trains',
 };
 
@@ -888,7 +888,7 @@ async function fetchAll() {
   checkAlerts();
 
   if (errs.length) {
-    setStatus('warn', `${trains.length} trains loaded (${errs.join(', ')} unavailable — possible CORS issue if running locally)`);
+    setStatus('warn', `${trains.length} trains loaded (${errs.join(', ')} data unavailable)`);
   } else {
     setStatus('ok', `${trains.length} trains — updated ${new Date().toLocaleTimeString()}`);
   }
