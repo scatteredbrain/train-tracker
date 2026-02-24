@@ -565,6 +565,8 @@ let countdown    = CFG.refreshSecs;
 let countdownTimer, refreshTimer;
 let posHistory   = {}; // { trainId: [{lat, lng, t}] }
 const HIST_MAX   = 8;
+let drState      = {}; // { trainId: { lat, lng, headingDeg, speedMph, fetchTime } }
+let drTimer      = null;
 
 /* ── Haversine distance (miles) ─────────────────────────────── */
 function distMiles(lat1, lon1, lat2, lon2) {
@@ -574,6 +576,42 @@ function distMiles(lat1, lon1, lat2, lon2) {
   const a = Math.sin(dLat/2)**2 +
             Math.cos(lat1*r) * Math.cos(lat2*r) * Math.sin(dLon/2)**2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+/* ── Dead reckoning ─────────────────────────────────────────── */
+const COMPASS_DEG = {
+  N:0, NNE:22.5, NE:45, ENE:67.5,
+  E:90, ESE:112.5, SE:135, SSE:157.5,
+  S:180, SSW:202.5, SW:225, WSW:247.5,
+  W:270, WNW:292.5, NW:315, NNW:337.5,
+};
+
+function headingToDeg(h) {
+  if (!h) return null;
+  const n = parseFloat(h);
+  if (!isNaN(n)) return n;
+  return COMPASS_DEG[String(h).toUpperCase().trim()] ?? null;
+}
+
+function drTick() {
+  const now = Date.now();
+  for (const t of allTrains) {
+    const dr = drState[t.id];
+    if (!dr || dr.speedMph < 2 || dr.headingDeg === null) continue;
+    /* Cap extrapolation at 90 s to prevent wild drift on slow refreshes */
+    const hrs = Math.min((now - dr.fetchTime) / 3600000, 90 / 3600);
+    const dist = dr.speedMph * hrs; // miles
+    const hdRad = dr.headingDeg * Math.PI / 180;
+    const R = 3958.8;
+    const dLat = (dist * Math.cos(hdRad) / R) * (180 / Math.PI);
+    const dLng = (dist * Math.sin(hdRad) / (R * Math.cos(dr.lat * Math.PI / 180))) * (180 / Math.PI);
+    trainMarkers[t.id]?.setLatLng([dr.lat + dLat, dr.lng + dLng]);
+  }
+}
+
+function startDR() {
+  if (drTimer) clearInterval(drTimer);
+  drTimer = setInterval(drTick, 1000);
 }
 
 /* ── Position history & ETA to crossing ─────────────────────── */
@@ -974,6 +1012,35 @@ async function fetchAll() {
   updatePosHistory(trains);
   allTrains = trains;
 
+  /* Populate dead-reckoning anchors */
+  const fetchTime = Date.now();
+  const liveIds = new Set(trains.map(t => t.id));
+  for (const id of Object.keys(drState)) {
+    if (!liveIds.has(id)) delete drState[id];
+  }
+  for (const t of trains) {
+    let speedMph = t.speed ?? 0;
+    if (!speedMph) {
+      const hist = posHistory[t.id];
+      if (hist && hist.length >= 2) {
+        const n = hist.length;
+        const prev = hist[n - 2];
+        const curr = hist[n - 1];
+        const hrs = (curr.t - prev.t) / 3600000;
+        if (hrs > 0.0005) {
+          speedMph = distMiles(prev.lat, prev.lng, curr.lat, curr.lng) / hrs;
+        }
+      }
+    }
+    drState[t.id] = {
+      lat:        t.lat,
+      lng:        t.lng,
+      headingDeg: headingToDeg(t.heading),
+      speedMph:   Math.min(speedMph, 150),
+      fetchTime,
+    };
+  }
+
   /* Update markers */
   for (const t of trains) upsertMarker(t);
   pruneMarkers(trains.map(t => t.id));
@@ -1086,6 +1153,7 @@ function requestNotificationPermission() {
 initMap();
 restoreLocation();
 requestNotificationPermission();
+startDR();
 scheduleRefresh();
 </script>
 </body>
