@@ -563,6 +563,8 @@ let showAmtrak   = true;
 let nearbyOnly   = false;
 let countdown    = CFG.refreshSecs;
 let countdownTimer, refreshTimer;
+let posHistory   = {}; // { trainId: [{lat, lng, t}] }
+const HIST_MAX   = 8;
 
 /* ── Haversine distance (miles) ─────────────────────────────── */
 function distMiles(lat1, lon1, lat2, lon2) {
@@ -572,6 +574,47 @@ function distMiles(lat1, lon1, lat2, lon2) {
   const a = Math.sin(dLat/2)**2 +
             Math.cos(lat1*r) * Math.cos(lat2*r) * Math.sin(dLon/2)**2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+/* ── Position history & ETA to crossing ─────────────────────── */
+function updatePosHistory(trains) {
+  const now    = Date.now();
+  const liveIds = new Set(trains.map(t => t.id));
+  for (const id of Object.keys(posHistory)) {
+    if (!liveIds.has(id)) delete posHistory[id];
+  }
+  for (const t of trains) {
+    if (!posHistory[t.id]) posHistory[t.id] = [];
+    const hist = posHistory[t.id];
+    const last = hist[hist.length - 1];
+    /* Only record when train moves ≥ ~100 ft to avoid duplicates */
+    if (!last || distMiles(last.lat, last.lng, t.lat, t.lng) > 0.02) {
+      hist.push({ lat: t.lat, lng: t.lng, t: now });
+      if (hist.length > HIST_MAX) hist.shift();
+    }
+  }
+}
+
+/* Returns { approaching, etaMins, closingMph } or null */
+function getApproach(t) {
+  if (!userLoc) return null;
+  const hist = posHistory[t.id];
+  if (!hist || hist.length < 2) return { approaching: null, etaMins: null, closingMph: null };
+
+  const n    = hist.length;
+  const prev = hist[n - 2];
+  const curr = hist[n - 1];
+  const hrs  = (curr.t - prev.t) / 3600000;
+  if (hrs < 0.0005) return { approaching: null, etaMins: null, closingMph: null };
+
+  const dPrev      = distMiles(prev.lat, prev.lng, userLoc.lat, userLoc.lng);
+  const dCurr      = distMiles(curr.lat, curr.lng, userLoc.lat, userLoc.lng);
+  const closingMph = (dPrev - dCurr) / hrs;
+
+  if (closingMph <= 2) return { approaching: false, etaMins: null, closingMph };
+
+  const curDist = distMiles(t.lat, t.lng, userLoc.lat, userLoc.lng);
+  return { approaching: true, etaMins: (curDist / closingMph) * 60, closingMph };
 }
 
 /* ── Map init ───────────────────────────────────────────────── */
@@ -616,6 +659,7 @@ function setUserLoc(lat, lng, source) {
 
   renderList();
   checkAlerts();
+  refreshPopups();
 }
 
 function clearUserLoc() {
@@ -627,6 +671,7 @@ function clearUserLoc() {
   document.getElementById('clear-loc-btn').style.display = 'none';
   renderList();
   checkAlerts();
+  refreshPopups();
 }
 
 /* ── Fetch helpers ──────────────────────────────────────────── */
@@ -720,6 +765,17 @@ function popupHtml(t) {
   const speed = t.speed !== undefined
     ? `<div class="popup-row"><strong>Speed:</strong> ${t.speed} mph</div>`
     : '';
+  const ap = getApproach(t);
+  const etaPopup = (() => {
+    if (!ap || !userLoc) return '';
+    if (ap.approaching === null)
+      return `<div class="popup-row"><strong>ETA to crossing:</strong> Calculating…</div>`;
+    if (!ap.approaching)
+      return `<div class="popup-row"><strong>ETA to crossing:</strong> <span style="color:var(--muted)">${ap.closingMph < -2 ? 'Moving away' : '—'}</span></div>`;
+    const mins = Math.round(ap.etaMins);
+    const col  = mins <= 5 ? 'var(--danger)' : 'var(--warn)';
+    return `<div class="popup-row"><strong>ETA to crossing:</strong> <span style="color:${col};font-weight:600">~${mins} min</span></div>`;
+  })();
   return `
     <div class="popup-title">${typeBadge} Train #${t.num}</div>
     <div class="popup-row"><strong>Line/Route:</strong> ${t.line}</div>
@@ -730,6 +786,7 @@ function popupHtml(t) {
     ${speed}
     ${t.heading ? `<div class="popup-row"><strong>Heading:</strong> ${t.heading}</div>` : ''}
     ${dist}
+    ${etaPopup}
   `;
 }
 
@@ -745,6 +802,12 @@ function upsertMarker(t) {
       .bindPopup(popupHtml(t), { maxWidth: 260 })
       .addTo(map);
     trainMarkers[t.id] = m;
+  }
+}
+
+function refreshPopups() {
+  for (const t of allTrains) {
+    trainMarkers[t.id]?.getPopup()?.setContent(popupHtml(t));
   }
 }
 
@@ -769,11 +832,18 @@ function renderList() {
     return true;
   });
 
-  /* Attach distances and sort */
+  /* Attach distances, approach info, and sort */
   trains = trains.map(t => ({
     ...t,
-    dist: userLoc ? distMiles(userLoc.lat, userLoc.lng, t.lat, t.lng) : null,
+    dist:     userLoc ? distMiles(userLoc.lat, userLoc.lng, t.lat, t.lng) : null,
+    approach: getApproach(t),
   })).sort((a, b) => {
+    /* Approaching trains bubble to top, sorted by ETA */
+    const aEta = a.approach?.approaching ? (a.approach.etaMins ?? Infinity) : Infinity;
+    const bEta = b.approach?.approaching ? (b.approach.etaMins ?? Infinity) : Infinity;
+    if (aEta !== Infinity && bEta !== Infinity) return aEta - bEta;
+    if (aEta !== Infinity) return -1;
+    if (bEta !== Infinity) return  1;
     if (a.dist !== null && b.dist !== null) return a.dist - b.dist;
     if (a.dist !== null) return -1;
     if (b.dist !== null) return  1;
@@ -802,6 +872,19 @@ function renderList() {
       ? `<span class="meta-item">🧭 ${t.heading}</span>` : '';
     const speedHtml = t.speed !== undefined && t.speed > 0
       ? `<span class="meta-item">⚡ ${t.speed} mph</span>` : '';
+    const etaHtml = (() => {
+      const ap = t.approach;
+      if (!ap || t.dist === null || t.dist > alertRadius * 4) return '';
+      if (ap.approaching === null)
+        return t.dist <= alertRadius * 2
+          ? `<span class="meta-item" style="color:var(--muted)">⏱ Calculating…</span>` : '';
+      if (!ap.approaching)
+        return t.dist <= alertRadius && ap.closingMph < -2
+          ? `<span class="meta-item" style="color:var(--muted)">↗ Moving away</span>` : '';
+      const mins = Math.round(ap.etaMins);
+      const col  = mins <= 3 ? 'var(--danger)' : mins <= 10 ? '#f97316' : 'var(--warn)';
+      return `<span class="meta-item" style="color:${col};font-weight:600">⏱ ~${mins} min to crossing</span>`;
+    })();
 
     return `
       <div class="train-card ${isNear ? 'alert' : ''}"
@@ -815,7 +898,7 @@ function renderList() {
         ${t.cur  ? `<div class="card-stop" style="color:var(--text)">📍 ${t.cur}</div>` : ''}
         ${t.next ? `<div class="card-stop" style="color:var(--muted)">➡ Next: ${t.next}</div>` : ''}
         <div class="card-meta">
-          ${latenessHtml}${headingHtml}${speedHtml}
+          ${etaHtml}${latenessHtml}${headingHtml}${speedHtml}
         </div>
       </div>`;
   }).join('');
@@ -836,16 +919,26 @@ function checkAlerts() {
     .filter(t => (showSepta && t.type === 'septa') || (showAmtrak && t.type === 'amtrak'))
     .map(t => ({ ...t, dist: distMiles(userLoc.lat, userLoc.lng, t.lat, t.lng) }))
     .filter(t => t.dist <= alertRadius)
-    .sort((a, b) => a.dist - b.dist);
+    .sort((a, b) => {
+      const aEta = getApproach(a)?.etaMins ?? Infinity;
+      const bEta = getApproach(b)?.etaMins ?? Infinity;
+      if (aEta !== Infinity && bEta !== Infinity) return aEta - bEta;
+      if (aEta !== Infinity) return -1;
+      if (bEta !== Infinity) return  1;
+      return a.dist - b.dist;
+    });
 
   if (close.length === 0) {
     banner.classList.remove('visible');
     return;
   }
 
-  const names = close.slice(0, 3).map(t =>
-    `#${t.num} (${t.dist.toFixed(1)} mi${t.heading ? ' · ' + t.heading : ''})`
-  ).join(', ');
+  const names = close.slice(0, 3).map(t => {
+    const ap = getApproach(t);
+    const etaStr = ap?.approaching && ap.etaMins !== null
+      ? ` · ~${Math.round(ap.etaMins)}m` : '';
+    return `#${t.num} (${t.dist.toFixed(1)} mi${etaStr})`;
+  }).join(', ');
   banner.textContent = `⚠ ${close.length} train${close.length > 1 ? 's' : ''} within ${alertRadius} miles: ${names}`;
   banner.classList.add('visible');
 
@@ -878,6 +971,7 @@ async function fetchAll() {
     console.warn('Amtrak fetch failed:', amtRes.reason);
   }
 
+  updatePosHistory(trains);
   allTrains = trains;
 
   /* Update markers */
