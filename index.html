@@ -587,8 +587,8 @@ function updatePosHistory(trains) {
     if (!posHistory[t.id]) posHistory[t.id] = [];
     const hist = posHistory[t.id];
     const last = hist[hist.length - 1];
-    /* Only record when train moves ≥ ~100 ft to avoid duplicates */
-    if (!last || distMiles(last.lat, last.lng, t.lat, t.lng) > 0.02) {
+    /* Record once per poll cycle (5 s gate prevents sub-second duplicates) */
+    if (!last || (now - last.t) > 5000) {
       hist.push({ lat: t.lat, lng: t.lng, t: now });
       if (hist.length > HIST_MAX) hist.shift();
     }
